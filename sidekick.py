@@ -61,6 +61,12 @@ class Sidekick:
     You have a tool to run python code, but note that you would need to include a print() statement if you wanted to receive output.
     The current date and time is {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
 
+    IMPORTANT: Whenever you create a Markdown (.md) file using the write_file tool, you MUST automatically convert it to PDF format:
+    1. First use write_file to create the .md file (e.g., 'report.md')
+    2. Then IMMEDIATELY use markdown_to_pdf to convert it to PDF (e.g., 'report.md' -> 'report.pdf')
+    3. Both files should be in the 'sandbox' directory
+    4. Always create the PDF version - do not skip this step!
+
     This is the success criteria:
     {state["success_criteria"]}
     You should reply either with a question for the user about this assignment, or with your final response.
