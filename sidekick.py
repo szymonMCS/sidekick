@@ -23,6 +23,8 @@ class State(TypedDict):
     feedback_on_work: Optional[str]
     success_criteria_met: bool
     user_input_needed: bool
+    clarification_questions: List[str]
+    clarifications_collected: int
 
 
 class EvaluatorOutput(BaseModel):
@@ -33,6 +35,11 @@ class EvaluatorOutput(BaseModel):
     )
 
 
+class ClarificationOutput(BaseModel):
+    questions: List[str] = Field(description="List of up to 3 clarifying questions")
+    needs_clarification: bool = Field(description="Whether clarification is needed")
+
+
 class Sidekick:
     def __init__(self):
         self.worker_llm_with_tools = None
@@ -41,6 +48,8 @@ class Sidekick:
         self.llm_with_tools = None
         self.graph = None
         self.sidekick_id = str(uuid.uuid4())
+        self.current_thread_id = str(uuid.uuid4())
+        self.clarifications_done = False
         self.memory = MemorySaver()
         self.browser = None
         self.playwright = None
@@ -170,6 +179,57 @@ class Sidekick:
         }
         return new_state
 
+    def clarification_agent(self, state: State) -> Dict[str, Any]:
+        """Ask up to 3 claryfying questions before proceeding"""
+        # Skip if already asked clarifications in this conversation
+        if state.get("clarifications_collected", 0) > 0:
+            print(f"[DEBUG] Skipping clarification - already collected: {state.get('clarifications_collected')}")
+            return {"clarifications_collected": state["clarifications_collected"]}
+
+        clarification_llm = ChatOpenAI(model="gpt-4o-mini").with_structured_output(ClarificationOutput)
+
+        system_message = """You are a clarification specialist. Based on the user's request generate
+        up to 3 important clarifying questions that would help complete the task better.
+        Only ask questions if they would significantly improve the outcome.
+
+        IMPORTANT: Respond in the SAME LANGUAGE as the user's request. If the user writes in Polish, respond in Polish.
+        If in English, respond in English. Match the user's language exactly."""
+
+        # Get user request content (handle both string and HumanMessage)
+        first_msg = state['messages'][0]
+        user_request = first_msg.content if hasattr(first_msg, 'content') else first_msg
+
+        user_message = f"User request: {user_request}\nSuccess criteria: {state['success_criteria']}"
+
+        result = clarification_llm.invoke([
+            SystemMessage(content=system_message),
+            HumanMessage(content=user_message)
+        ])
+
+        if result.needs_clarification and result.questions:
+            # Detect user's language and create appropriate intro message
+
+            # Ask LLM to create intro in user's language
+            intro_llm = ChatOpenAI(model="gpt-4o-mini")
+            intro_prompt = f"""Generate a brief introduction message in the SAME LANGUAGE as this request: "{user_request}"
+
+            The message should say something like "Before I proceed, I have these clarifying questions:" but in the request's language.
+            Reply ONLY with the intro message, nothing else."""
+
+            intro_result = intro_llm.invoke([HumanMessage(content=intro_prompt)])
+            intro_text = intro_result.content.strip()
+
+            questions_text = "\n".join([f"{i+1}. {q}" for i, q in enumerate(result.questions)])
+            return {
+                "messages": [AIMessage(content=f"{intro_text}\n\n{questions_text}")],
+                "user_input_needed": True,
+                "clarification_questions": result.questions,
+                "clarifications_collected": 1
+            }
+
+        return {"clarifications_collected": 1}
+
+
     def route_based_on_evaluation(self, state: State) -> str:
         if state["success_criteria_met"] or state["user_input_needed"]:
             return "END"
@@ -184,6 +244,7 @@ class Sidekick:
         graph_builder.add_node("worker", self.worker)
         graph_builder.add_node("tools", ToolNode(tools=self.tools))
         graph_builder.add_node("evaluator", self.evaluator)
+        graph_builder.add_node("clarification", self.clarification_agent)
 
         # Add edges
         graph_builder.add_conditional_edges(
@@ -193,26 +254,60 @@ class Sidekick:
         graph_builder.add_conditional_edges(
             "evaluator", self.route_based_on_evaluation, {"worker": "worker", "END": END}
         )
-        graph_builder.add_edge(START, "worker")
+        graph_builder.add_edge(START, "clarification")
+        graph_builder.add_conditional_edges(
+            "clarification",
+            lambda state: "END" if state.get("user_input_needed") else "worker",
+            {"worker": "worker", "END": END}
+        )
 
         # Compile the graph
         self.graph = graph_builder.compile(checkpointer=self.memory)
 
     async def run_superstep(self, message, success_criteria, history):
-        config = {"configurable": {"thread_id": self.sidekick_id}}
+        if not history:
+            self.current_thread_id = str(uuid.uuid4())
+            self.clarifications_done = False
+
+        config = {"configurable": {"thread_id": self.current_thread_id}}
 
         state = {
-            "messages": message,
+            "messages": [HumanMessage(content=message)],
             "success_criteria": success_criteria or "The answer should be clear and accurate",
             "feedback_on_work": None,
             "success_criteria_met": False,
             "user_input_needed": False,
+            "clarification_questions": [],
+            "clarifications_collected": 1 if self.clarifications_done else 0,  # Skip if already done
         }
         result = await self.graph.ainvoke(state, config=config)
-        user = {"role": "user", "content": message}
-        reply = {"role": "assistant", "content": result["messages"][-2].content}
-        feedback = {"role": "assistant", "content": result["messages"][-1].content}
-        return history + [user, reply, feedback]
+
+        # Mark clarifications as done after first interaction
+        if result.get("user_input_needed"):
+            self.clarifications_done = True
+
+        # For Gradio UI history:
+        # 1. Add user message (for display in chatbot)
+        # 2. Add assistant's main reply
+        # 3. Add evaluator feedback (if present)
+
+        user_msg = {"role": "user", "content": message}
+
+        # Get assistant messages from result
+        assistant_messages = [msg for msg in result["messages"] if isinstance(msg, AIMessage)]
+
+        if len(assistant_messages) >= 2:
+            # Normal case: reply + feedback
+            reply = {"role": "assistant", "content": assistant_messages[-2].content}
+            feedback = {"role": "assistant", "content": assistant_messages[-1].content}
+            return history + [user_msg, reply, feedback]
+        elif len(assistant_messages) == 1:
+            # Only one message (e.g., clarification questions)
+            reply = {"role": "assistant", "content": assistant_messages[-1].content}
+            return history + [user_msg, reply]
+        else:
+            # Fallback
+            return history + [user_msg]
 
     def cleanup(self):
         if self.browser:
