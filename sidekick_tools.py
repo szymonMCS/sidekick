@@ -11,6 +11,8 @@ from langchain_community.utilities import GoogleSerperAPIWrapper
 from langchain_community.utilities.wikipedia import WikipediaAPIWrapper
 import markdown2
 import pdfkit
+from sqlalchemy import create_engine, text
+import json
 
 
 load_dotenv(override=True)
@@ -112,10 +114,31 @@ async def other_tools():
         then use this tool to convert it to PDF. Both paths should typically be in the 'sandbox' directory."""
     )
 
+    sql_tool = Tool(
+        name="sql_query",
+        func=execute_sql_query,
+        description="""Execute SQL queries on SQLite database for data storage and retrieval.
+
+        Use this to:
+        - CREATE TABLE to store data
+        - INSERT data into tables
+        - SELECT to retrieve data
+        - UPDATE or DELETE records
+
+        Examples:
+        - CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, email TEXT)
+        - INSERT INTO users (name, email) VALUES ('John', 'john@example.com')
+        - SELECT * FROM users WHERE name = 'John'
+        - UPDATE users SET email = 'new@example.com' WHERE id = 1
+
+        Database location: sandbox/data.db (auto-created)
+        Returns: JSON for SELECT, success message for other queries"""
+    )
+
     wikipedia = WikipediaAPIWrapper()
     wiki_tool = WikipediaQueryRun(api_wrapper=wikipedia)
 
     python_repl = PythonREPLTool()
     
-    return file_tools + [push_tool, tool_search, python_repl, wiki_tool, markdown_pdf_tool]
+    return file_tools + [push_tool, tool_search, python_repl, wiki_tool, markdown_pdf_tool, sql_tool]
 
