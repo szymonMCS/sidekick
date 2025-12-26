@@ -5,7 +5,7 @@ from langgraph.graph.message import add_messages
 from dotenv import load_dotenv
 from langgraph.prebuilt import ToolNode
 from langchain_openai import ChatOpenAI
-from langgraph.checkpoint.memory import MemorySaver
+from langgraph.checkpoint.sqlite import SqliteSaver
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from typing import List, Any, Optional, Dict
 from pydantic import BaseModel, Field
@@ -47,10 +47,11 @@ class Sidekick:
         self.tools = None
         self.llm_with_tools = None
         self.graph = None
+        self.user_id = user_id
         self.sidekick_id = str(uuid.uuid4())
         self.current_thread_id = str(uuid.uuid4())
         self.clarifications_done = False
-        self.memory = MemorySaver()
+        self.memory = SqliteSaver.from_conn_string(f"sandbox/memory_{user_id}.db")
         self.browser = None
         self.playwright = None
 
@@ -75,6 +76,13 @@ class Sidekick:
     2. Then IMMEDIATELY use markdown_to_pdf to convert it to PDF (e.g., 'report.md' -> 'report.pdf')
     3. Both files should be in the 'sandbox' directory
     4. Always create the PDF version - do not skip this step!
+
+    SQL DATABASE TOOL:
+    You have access to a SQLite database via sql_query tool. Use it to:
+    - Store user preferences (CREATE TABLE preferences ...)
+    - Remember information across conversations (INSERT, UPDATE)
+    - Query historical data (SELECT)
+    Database location: sandbox/data.db (auto-created if needed)
 
     This is the success criteria:
     {state["success_criteria"]}
