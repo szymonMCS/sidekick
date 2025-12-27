@@ -13,6 +13,7 @@ from sidekick_tools import playwright_tools, other_tools
 import uuid
 import asyncio
 from datetime import datetime
+import os
 
 load_dotenv(override=True)
 
@@ -25,6 +26,8 @@ class State(TypedDict):
     user_input_needed: bool
     clarification_questions: List[str]
     clarifications_collected: int
+    current_specialist: Optional[str]
+    specialist_history: List[str]
 
 
 class EvaluatorOutput(BaseModel):
@@ -41,7 +44,7 @@ class ClarificationOutput(BaseModel):
 
 
 class Sidekick:
-    def __init__(self):
+    def __init__(self, user_id: str = "default"):
         self.worker_llm_with_tools = None
         self.evaluator_llm_with_output = None
         self.tools = None
@@ -238,6 +241,187 @@ class Sidekick:
         return {"clarifications_collected": 1}
 
 
+    def coordinator_agent(self, state: State) -> Dict[str, Any]:
+        """Decides which specialist should hande task"""
+
+        #get user request
+        first_msg = state['messages'][0]
+        user_request = first_msg.content if hasattr(first_msg, 'content') else first_msg
+
+        #LLm choose specialist
+        coordinator_llm = ChatOpenAI(model="gpt-4o-mini")
+
+        system_message = """You are a task coordinator. Analyze the user's request and decide
+        which specialist should handle it.
+
+    Available specialists:
+    - "research": For web searches, finding information, browsing websites, Wikipedia lookups
+    - "coding": For writing/executing Python code, file operations, creating documents, markdown/PDF generation
+    - "communication": For sending notifications, emails, or other communication tasks
+    - "general": For simple questions, conversations, or tasks that don't fit other categories
+
+    Respond ONLY ONE WORD: research, coding, communication or general"""
+
+        user_message = f"User request: {user_request}\n\nWhich specialist should handle this?"
+
+        result = coordinator_llm.invoke([
+            SystemMessage(content=system_message),
+            HumanMessage(content=user_message)
+        ])
+
+        specialist = result.content.strip().lower()
+
+        #Response validation
+        if specialist not in ["research", "coding", "communication", "general"]:
+            specialist = "general"
+        print(f"[COORDINATOR] Routing to: {specialist}")
+
+        #Update specialist history
+        history = state.get("specialist_history", [])
+        history.append(specialist)
+
+        return {
+            "current_specialist": specialist,
+            "specialist_history": history
+        }
+
+    def research_agent(self, state: State) -> Dict[str, Any]:
+        """Specialized agent for research tasks - web search, browsing, Wikipedia"""
+
+        system_message = f"""You are a research specialist. Your job is to gather infromation using:
+    - Web search (search tool)
+    - Wikipedia (wikipedia_run_tool)
+    - Web browsing (navigate_browser, get_elements tools)
+    
+    Focus ONLY on research and information gathering. Be through and cite sources.
+    The current date and time is {datetime.now().strftime("%Y-%m-%d %H:%M:%s")}
+    
+    Success criteria: {state["success_criteria"]}
+    """
+
+        if state.get("feedback_on_work"):
+            system_message += f"""
+    Previously your research was incomplete. Feedback:
+    {state["feedback_on_work"]}
+    Please improve your research based on this feedback."""
+
+        research_tool_names = ["search", "wikipedia_run", "navigate_browser", "get_elements", "click"]
+        research_tools = [t for t in self.tools if t.name in research_tool_names]
+
+        research_llm = ChatOpenAI(model="gpt-4o-mini").bind_tools(research_tools)
+
+        found_system = False
+        messages = state["messages"]
+        for message in messages:
+            if isinstance(message, SystemMessage):
+                message.content = system_message
+                found_system = True
+
+        if not found_system:
+            messages = [SystemMessage(content=system_message)] + messages
+
+        response = research_llm.invoke(messages)
+
+        return {"messages": [response]}
+
+    def coding_agent(self, state: State) -> Dict[str, Any]:
+        """Specialized agent for coding tasks - Python execution, file operations, document creation"""
+
+        system_message = f"""You are a coding specialist. Your job is to:
+    - Execute Python code (python_repl tool)
+    - Manipulate files (write_file, read_file, list_directory, copy_file, move_file, file_delete)
+    - Create documents (write markdown files, then convert to PDF with markdown_to_pdf)
+
+    IMPORTANT: When creating markdown documents, ALWAYS convert them to PDF:
+    1. Use write_file to create the .md file (e.g., 'report.md')
+    2. IMMEDIATELY use markdown_to_pdf to convert (e.g., 'sandbox/report.md' -> 'sandbox/report.pdf')
+    3. Both files should be in 'sandbox' directory
+
+    The current date and time is {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
+
+    Success criteria: {state["success_criteria"]}
+    """
+
+        if state.get("feedback_on_work"):
+            system_message += f"""
+    Previously your code/work was incomplete. Feedback:
+    {state["feedback_on_work"]}
+    Please fix the issues based on this feedback."""
+
+        # Filter tools to coding-only
+        coding_tool_names = [
+            "python_repl", "write_file", "read_file", "list_directory",
+            "copy_file", "move_file", "file_delete", "markdown_to_pdf"
+        ]
+        coding_tools = [t for t in self.tools if t.name in coding_tool_names]
+
+        # Bind LLM with coding tools only
+        coding_llm = ChatOpenAI(model="gpt-4o-mini").bind_tools(coding_tools)
+
+        # Prepare messages
+        found_system = False
+        messages = state["messages"]
+        for message in messages:
+            if isinstance(message, SystemMessage):
+                message.content = system_message
+                found_system = True
+
+        if not found_system:
+            messages = [SystemMessage(content=system_message)] + messages
+
+        # Invoke LLM
+        response = coding_llm.invoke(messages)
+
+        return {"messages": [response]}
+
+
+    def communication_agent(self, state: State) -> Dict[str, Any]:
+        """Specialized agent for communication tasks - notifications, emails"""
+
+        system_message = f"""You are a communication specialist. Your job is to:
+    - Send push notifications (send_push_notification tool)
+    - Handle user communication tasks
+
+    Be concise and clear in your communications.
+    The current date and time is {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
+
+    Success criteria: {state["success_criteria"]}
+    """
+
+        if state.get("feedback_on_work"):
+            system_message += f"""
+    Previously your communication was unclear. Feedback:
+    {state["feedback_on_work"]}
+    Please improve based on this feedback."""
+
+        comm_tool_names = ["send_push_notification"]
+        comm_tools = [t for t in self.tools if t.name in comm_tool_names]
+        comm_llm = ChatOpenAI(model="gpt-4o-mini").bind_tools(comm_tools)
+
+        found_system = False
+        messages = state["messages"]
+        for message in messages:
+            if isinstance(message, SystemMessage):
+                message.content = system_message
+                found_system = True
+
+        if not found_system:
+            messages = [SystemMessage(content=system_message)] + messages
+
+        response = comm_llm.invoke(messages)
+
+        return {"messages": [response]}
+
+    def specialist_router(self, state: State) -> str:
+        """Route to appropriate specialist or back to tools"""
+        last_message = state["messages"][-1]
+
+        if hasattr(last_message, "tool_calls") and last_message.tool_calls:
+            return "tools"
+        else:
+            return "evaluator"
+
+
     def route_based_on_evaluation(self, state: State) -> str:
         if state["success_criteria_met"] or state["user_input_needed"]:
             return "END"
@@ -249,36 +433,82 @@ class Sidekick:
         graph_builder = StateGraph(State)
 
         # Add nodes
+        graph_builder.add_node("coordinator", self.coordinator_agent)
+        graph_builder.add_node("research_agent", self.research_agent)
+        graph_builder.add_node("coding_agent", self.coding_agent)
+        graph_builder.add_node("communication_agent", self.communication_agent)
         graph_builder.add_node("worker", self.worker)
         graph_builder.add_node("tools", ToolNode(tools=self.tools))
         graph_builder.add_node("evaluator", self.evaluator)
         graph_builder.add_node("clarification", self.clarification_agent)
 
+        def route_to_specialist(state: State) -> str:
+            specialist = state.get("current_specialist", "general")
+            if specialist == "research":
+                return "research_agent"
+            elif specialist == "coding":
+                return "coding_agent"
+            elif specialist == "communication":
+                return "communication_agent"
+            else:
+                return "worker"
+
         # Add edges
-        graph_builder.add_conditional_edges(
-            "worker", self.worker_router, {"tools": "tools", "evaluator": "evaluator"}
-        )
-        graph_builder.add_edge("tools", "worker")
-        graph_builder.add_conditional_edges(
-            "evaluator", self.route_based_on_evaluation, {"worker": "worker", "END": END}
-        )
         graph_builder.add_edge(START, "clarification")
+
+        # Clarification routing
         graph_builder.add_conditional_edges(
             "clarification",
-            lambda state: "END" if state.get("user_input_needed") else "worker",
-            {"worker": "worker", "END": END}
+            lambda state: "END" if state.get("user_input_needed") else "coordinator",
+            {"coordinator": "coordinator", "END": END}
+        )
+
+        # Coordinator routes to specialists
+        graph_builder.add_conditional_edges(
+            "coordinator",
+            route_to_specialist,
+            {
+                "research_agent": "research_agent",
+                "coding_agent": "coding_agent",
+                "communication_agent": "communication_agent",
+                "worker": "worker"
+            }
+        )
+
+        # Each specialist routes to tools or evaluator
+        for specialist_node in ["research_agent", "coding_agent", "communication_agent", "worker"]:
+            graph_builder.add_conditional_edges(
+                specialist_node,
+                self.specialist_router,
+                {"tools": "tools", "evaluator": "evaluator"}
+            )
+
+        # Tools always go back to coordinator (might need different specialist)
+        graph_builder.add_edge("tools", "coordinator")
+
+        # Evaluator decides: continue (back to coordinator) or end
+        graph_builder.add_conditional_edges(
+            "evaluator",
+            self.route_based_on_evaluation,
+            {"worker": "coordinator", "END": END}  # Changed "worker" to "coordinator"
         )
 
         # Compile the graph
         self.graph = graph_builder.compile(checkpointer=self.memory)
 
+        
+
     async def run_superstep(self, message, success_criteria, history):
+        # Use different thread_id for each new conversation to reset clarifications
+        # If this is first message (empty history), create new thread
         if not history:
             self.current_thread_id = str(uuid.uuid4())
             self.clarifications_done = False
 
         config = {"configurable": {"thread_id": self.current_thread_id}}
 
+        # Create state with user message as HumanMessage for the graph
+        # Only ask clarifications on first message
         state = {
             "messages": [HumanMessage(content=message)],
             "success_criteria": success_criteria or "The answer should be clear and accurate",
@@ -286,7 +516,9 @@ class Sidekick:
             "success_criteria_met": False,
             "user_input_needed": False,
             "clarification_questions": [],
-            "clarifications_collected": 1 if self.clarifications_done else 0,  # Skip if already done
+            "clarifications_collected": 1 if self.clarifications_done else 0,
+            "current_specialist": None,
+            "specialist_history": [],
         }
         result = await self.graph.ainvoke(state, config=config)
 
