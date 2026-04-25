@@ -1,6 +1,15 @@
+import subprocess
+import os
 import gradio as gr
 from sidekick import Sidekick
 from user_auth import UserAuth
+
+subprocess.run(
+    ["playwright", "install", "--with-deps", "chromium"],
+    check=False,
+    stdout=subprocess.DEVNULL,
+    stderr=subprocess.DEVNULL,
+)
 
 # Initialize auth system
 auth = UserAuth()
@@ -191,4 +200,10 @@ with gr.Blocks(title="Sidekick Multi-User") as ui:
     )
 
 # Launch
-ui.launch(inbrowser=True, theme=gr.themes.Default(primary_hue="emerald"))
+_is_hf = os.getenv("SPACE_ID") is not None
+ui.launch(
+    server_name="0.0.0.0",
+    server_port=7860,
+    inbrowser=not _is_hf,
+    theme=gr.themes.Default(primary_hue="emerald"),
+)
