@@ -5,7 +5,8 @@ from langgraph.graph.message import add_messages
 from dotenv import load_dotenv
 from langgraph.prebuilt import ToolNode
 from langchain_openai import ChatOpenAI
-from langgraph.checkpoint.sqlite import SqliteSaver
+from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
+import aiosqlite
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from typing import List, Any, Optional, Dict
 from pydantic import BaseModel, Field
@@ -54,12 +55,25 @@ class Sidekick:
         self.sidekick_id = str(uuid.uuid4())
         self.current_thread_id = str(uuid.uuid4())
         self.clarifications_done = False
-        self.memory = SqliteSaver.from_conn_string(f"sandbox/memory_{user_id}.db")
+        self.memory = None
         self.browser = None
         self.playwright = None
+        self._db_conn = None
 
     async def setup(self):
-        self.tools, self.browser, self.playwright = await playwright_tools()
+        os.makedirs("sandbox", exist_ok=True)
+        self._db_conn = await aiosqlite.connect(f"sandbox/memory_{self.user_id}.db", timeout=30)
+        await self._db_conn.execute("PRAGMA journal_mode=WAL")
+        await self._db_conn.commit()
+        self.memory = AsyncSqliteSaver(self._db_conn)
+        try:
+            pw_tools, self.browser, self.playwright = await playwright_tools()
+            self.tools = pw_tools
+        except Exception as e:
+            print(f"Playwright unavailable: {e}")
+            self.tools = []
+            self.browser = None
+            self.playwright = None
         self.tools += await other_tools()
         worker_llm = ChatOpenAI(model="gpt-4o-mini")
         self.worker_llm_with_tools = worker_llm.bind_tools(self.tools)
@@ -294,7 +308,7 @@ class Sidekick:
     - Web browsing (navigate_browser, get_elements tools)
     
     Focus ONLY on research and information gathering. Be through and cite sources.
-    The current date and time is {datetime.now().strftime("%Y-%m-%d %H:%M:%s")}
+    The current date and time is {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
     
     Success criteria: {state["success_criteria"]}
     """
@@ -550,14 +564,16 @@ class Sidekick:
             return history + [user_msg]
 
     def cleanup(self):
-        if self.browser:
-            try:
-                loop = asyncio.get_running_loop()
+        try:
+            loop = asyncio.get_running_loop()
+            if self.browser:
                 loop.create_task(self.browser.close())
-                if self.playwright:
-                    loop.create_task(self.playwright.stop())
-            except RuntimeError:
-                # If no loop is running, do a direct run
+            if self.playwright:
+                loop.create_task(self.playwright.stop())
+            if self._db_conn:
+                loop.create_task(self._db_conn.close())
+        except RuntimeError:
+            if self.browser:
                 asyncio.run(self.browser.close())
-                if self.playwright:
-                    asyncio.run(self.playwright.stop())
+            if self.playwright:
+                asyncio.run(self.playwright.stop())
