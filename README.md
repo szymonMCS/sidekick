@@ -1,3 +1,12 @@
+---
+title: Sidekick
+emoji: 🚀
+colorFrom: blue
+colorTo: purple
+sdk: gradio
+app_file: app.py
+pinned: false
+---
 # 🤖 Sidekick Personal Co-Worker
 
 An intelligent AI assistant with multiple specialized agents that helps with daily tasks through web browsing, code execution, file management, and communication.
